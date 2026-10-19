@@ -1,1 +1,14 @@
+# Rust build output
 /target
+**/*.rs.bk
+*.pdb
+
+# IDEs / editors
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# macOS
+.DS_Store
