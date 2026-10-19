@@ -2,6 +2,7 @@ use std::{
     error::Error,
     io::{self, BufRead, IsTerminal, Write},
     process::ExitCode,
+    sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::Duration,
 };
@@ -77,14 +78,14 @@ fn interactive(tts: &mut Tts) -> Result<()> {
     if tty {
         println!("Reading mode. Type text and press Enter to hear it. /help for commands.");
     }
-    let mut lines = io::stdin().lock().lines();
+    let lines = spawn_stdin_reader();
 
     loop {
         if tty {
             print!("> ");
             io::stdout().flush()?;
         }
-        let Some(line) = lines.next() else { break };
+        let Some(line) = next_line(&lines) else { break };
         let line = line?;
         let line = line.trim();
         if line.is_empty() {
@@ -104,7 +105,7 @@ fn interactive(tts: &mut Tts) -> Result<()> {
                 print_help();
                 Ok(())
             }
-            "voices" | "v" => pick_voice(tts, arg, &mut lines),
+            "voices" | "v" => pick_voice(tts, arg, &lines),
             "voice" => find_voice(tts, arg).and_then(|v| {
                 tts.set_voice(&v)?;
                 println!("Voice set to {}.", v.name());
@@ -129,7 +130,7 @@ fn interactive(tts: &mut Tts) -> Result<()> {
 fn pick_voice(
     tts: &mut Tts,
     filter: &str,
-    lines: &mut impl Iterator<Item = io::Result<String>>,
+    lines: &Receiver<io::Result<String>>,
 ) -> Result<()> {
     let voices = filtered_voices(tts, filter)?;
     if voices.is_empty() {
@@ -144,7 +145,7 @@ fn pick_voice(
 
     print!("Select voice number (Enter to cancel): ");
     io::stdout().flush()?;
-    let Some(choice) = lines.next() else { return Ok(()) };
+    let Some(choice) = next_line(lines) else { return Ok(()) };
     let choice = choice?;
     let choice = choice.trim();
     if choice.is_empty() {
@@ -208,11 +209,55 @@ fn set_rate(tts: &mut Tts, mult: f32) -> Result<()> {
     Ok(())
 }
 
+/// Read stdin on a background thread so the main thread stays free to
+/// pump the run loop (see `pump`) while waiting for input.
+fn spawn_stdin_reader() -> Receiver<io::Result<String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// Wait for the next stdin line, pumping the run loop meanwhile.
+/// Returns None at end of input.
+fn next_line(lines: &Receiver<io::Result<String>>) -> Option<io::Result<String>> {
+    loop {
+        match lines.try_recv() {
+            Ok(line) => return Some(line),
+            Err(TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Empty) => pump(),
+        }
+    }
+}
+
 /// speak() is async; block until the engine finishes.
 fn wait_until_done(tts: &Tts) -> Result<()> {
-    thread::sleep(Duration::from_millis(100));
+    pump();
+    pump();
     while tts.is_speaking()? {
-        thread::sleep(Duration::from_millis(100));
+        pump();
     }
     Ok(())
+}
+
+/// Let the speech engine make progress for ~50ms.
+///
+/// On macOS, AVSpeechSynthesizer needs the main thread's run loop to turn,
+/// otherwise it goes silent after the voice is changed mid-session.
+#[cfg(target_os = "macos")]
+fn pump() {
+    use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
+    // SAFETY: reading an immutable CoreFoundation constant.
+    let mode = unsafe { kCFRunLoopDefaultMode };
+    CFRunLoop::run_in_mode(mode, Duration::from_millis(50), false);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pump() {
+    thread::sleep(Duration::from_millis(50));
 }

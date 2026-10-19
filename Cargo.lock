@@ -573,6 +573,7 @@ name = "say-it"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "core-foundation",
  "tts",
 ]
 
